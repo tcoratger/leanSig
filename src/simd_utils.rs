@@ -2,7 +2,7 @@ use core::array;
 
 use p3_field::PackedValue;
 
-use crate::{PackedF, array::FieldArray};
+use crate::{F, PackedF, array::FieldArray};
 
 /// Packs scalar arrays into SIMD-friendly vertical layout.
 ///
@@ -26,7 +26,7 @@ use crate::{PackedF, array::FieldArray};
 ///
 /// This vertical packing enables efficient SIMD operations where a single instruction
 /// processes the same element position across multiple arrays simultaneously.
-#[inline]
+#[inline(always)]
 pub fn pack_array<const N: usize>(data: &[FieldArray<N>]) -> [PackedF; N] {
     array::from_fn(|i| PackedF::from_fn(|j| data[j][i]))
 }
@@ -37,30 +37,26 @@ pub fn pack_array<const N: usize>(data: &[FieldArray<N>]) -> [PackedF; N] {
 ///
 /// This is the inverse operation of `pack_array`. The output buffer must be preallocated
 /// with size `[WIDTH]` where `WIDTH = PackedF::WIDTH`, and each element is a `FieldArray<N>`.
-///
-/// Input layout (vertical): each PackedF holds one element from each array
-/// ```text
-/// packed_data[0] = PackedF([a0, b0, c0, ...])
-/// packed_data[1] = PackedF([a1, b1, c1, ...])
-/// packed_data[2] = PackedF([a2, b2, c2, ...])
-/// ...
-/// ```
-///
-/// Output layout (horizontal): each FieldArray is one complete array
-/// ```text
-/// output[0] = FieldArray([a0, a1, a2, ..., aN])
-/// output[1] = FieldArray([b0, b1, b2, ..., bN])
-/// output[2] = FieldArray([c0, c1, c2, ..., cN])
-/// ...
-/// ```
-#[inline]
+#[inline(always)]
 pub fn unpack_array<const N: usize>(packed_data: &[PackedF; N], output: &mut [FieldArray<N>]) {
-    for (i, data) in packed_data.iter().enumerate().take(N) {
-        let unpacked_v = data.as_slice();
-        for j in 0..PackedF::WIDTH {
-            output[j][i] = unpacked_v[j];
+    // Optimized for cache locality: iterate over output lanes first
+    for j in 0..PackedF::WIDTH {
+        for i in 0..N {
+            output[j].0[i] = packed_data[i].as_slice()[j];
         }
     }
+}
+
+#[inline(always)]
+pub fn unpack_to_array<const N: usize>(
+    packed_data: [PackedF; N],
+) -> [FieldArray<N>; PackedF::WIDTH] {
+    array::from_fn(|j| FieldArray(array::from_fn(|i| packed_data[i].as_slice()[j])))
+}
+
+#[inline(always)]
+pub fn pack_column(col: [F; PackedF::WIDTH]) -> PackedF {
+    PackedF::from_fn(|i| col[i])
 }
 
 #[cfg(test)]
@@ -103,6 +99,24 @@ mod tests {
         // Unpack
         let mut output = [FieldArray([F::ZERO; 2]); PackedF::WIDTH];
         unpack_array(&packed, &mut output);
+
+        // Verify
+        for (lane, arr) in output.iter().enumerate() {
+            assert_eq!(arr[0], F::from_u64(lane as u64));
+            assert_eq!(arr[1], F::from_u64((lane + 100) as u64));
+        }
+    }
+
+    #[test]
+    fn test_unpack_to_array() {
+        // Create packed data
+        let packed: [PackedF; 2] = [
+            PackedF::from_fn(|i| F::from_u64(i as u64)),
+            PackedF::from_fn(|i| F::from_u64((i + 100) as u64)),
+        ];
+
+        // Unpack using the new function
+        let output = unpack_to_array(packed);
 
         // Verify
         for (lane, arr) in output.iter().enumerate() {
@@ -175,6 +189,26 @@ mod tests {
 
             // Verify roundtrip
             prop_assert_eq!(original, unpacked);
+        }
+
+        #[test]
+        fn proptest_unpack_to_array_matches_unpack_array(
+            _seed in any::<u64>()
+        ) {
+            let mut rng = rand::rng();
+
+            // Generate random packed data
+            let packed: [PackedF; 8] = array::from_fn(|_| {
+                PackedF::from_fn(|_| rng.random())
+            });
+
+            // Unpack using both methods
+            let mut output1 = [FieldArray([F::ZERO; 8]); PackedF::WIDTH];
+            unpack_array(&packed, &mut output1);
+            let output2 = unpack_to_array(packed);
+
+            // Verify they match
+            prop_assert_eq!(output1, output2);
         }
     }
 }
